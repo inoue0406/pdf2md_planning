@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# 中間生成物
+output/
+logs/
+tmp/
+
+# vendor (再現可能なのでgitに入れない方針)
+vendor/
+
+# 入力PDF (再配布回避。READMEのURLからダウンロード)
+data/
+
+# エディタ・セッション系
+.claude/
