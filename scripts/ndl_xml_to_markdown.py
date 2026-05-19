@@ -28,6 +28,8 @@ from typing import Iterable
 
 from lxml import etree
 
+from table_structure import TableConfig, render_table_block
+
 # Markdown化の際に無視するLINE TYPE（ページ番号・柱書きなど読み物のノイズ）
 SKIP_TYPES_DEFAULT = {"ノンブル", "柱", "広告文字"}
 
@@ -231,6 +233,7 @@ def block_to_markdown(
     include_figure_placeholder: bool,
     keep_running_header: bool,
     figures_map: dict[tuple[int, int, int, int], str] | None = None,
+    table_cfg: TableConfig | None = None,
 ) -> str | None:
     """1ブロックをMarkdown断片に変換。スキップ対象は None を返す。
 
@@ -238,6 +241,7 @@ def block_to_markdown(
         figures_map: ``(x, y, w, h) -> markdownから参照する画像の相対パス`` の辞書。
             ``図版`` BLOCK のキーがヒットすればコメントの代わりに ``![図版](path)``
             を出力する。
+        table_cfg: 表組の構造化変換の設定。``None`` で既定値。
     """
     if block.type_ in skip_types:
         return None
@@ -253,13 +257,20 @@ def block_to_markdown(
         return None
 
     if block.type_ == "表組":
-        # 表組はセル単位でテキストを出す（罫線レイアウト再構築はしない）。
+        # まずは座標から表の2D構造を再構築してMarkdown表に。失敗時はフラット箇条書きに
+        # フォールバック（旧挙動）。
+        md_table = render_table_block(block, table_cfg or TableConfig())
+        if md_table is not None:
+            return md_table
         cells = [ln.text for ln in block.lines if ln.text and ln.type_ not in skip_types]
         if not cells:
             return f"<!-- 表組 (x={block.x}, y={block.y}, w={block.w}, h={block.h}) -->"
-        # 表組内のテキストを箇条書きでフラットに出す（後段でLLM等で構造化しやすい）
+        # 構造化失敗時のフォールバック: 全セルをフラットな箇条書きで出す
         lines_md = "\n".join(f"- {c}" for c in cells)
-        return f"<!-- 表組開始 (x={block.x}, y={block.y}, w={block.w}, h={block.h}) -->\n{lines_md}\n<!-- 表組終了 -->"
+        return (
+            f"<!-- 表組開始 (x={block.x}, y={block.y}, w={block.w}, h={block.h}) "
+            f"fallback=list -->\n{lines_md}\n<!-- 表組終了 -->"
+        )
 
     # 柱書き（running header/footer）
     if not keep_running_header and _looks_like_running_header(block, page_w, page_h):
@@ -314,6 +325,7 @@ def xml_to_markdown(
     include_figure_placeholder: bool = True,
     keep_running_header: bool = False,
     figures_map: dict[tuple[int, int, int, int], str] | None = None,
+    table_cfg: TableConfig | None = None,
 ) -> str:
     skip = set(skip_types)
     tree = etree.parse(str(xml_path))
@@ -329,7 +341,7 @@ def xml_to_markdown(
     for b in blocks:
         chunk = block_to_markdown(
             b, page_w, page_h, skip, include_figure_placeholder,
-            keep_running_header, figures_map,
+            keep_running_header, figures_map, table_cfg,
         )
         if chunk:
             md_chunks.append(chunk)
