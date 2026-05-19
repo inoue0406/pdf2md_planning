@@ -5,6 +5,7 @@ description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
     "lxml>=6.1.0",
+    "pillow>=12.2.0",
     "pymupdf>=1.27.2.3",
     "tqdm>=4.67.3",
 ]

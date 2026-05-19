@@ -230,12 +230,24 @@ def block_to_markdown(
     skip_types: set[str],
     include_figure_placeholder: bool,
     keep_running_header: bool,
+    figures_map: dict[tuple[int, int, int, int], str] | None = None,
 ) -> str | None:
-    """1ブロックをMarkdown断片に変換。スキップ対象は None を返す。"""
+    """1ブロックをMarkdown断片に変換。スキップ対象は None を返す。
+
+    Args:
+        figures_map: ``(x, y, w, h) -> markdownから参照する画像の相対パス`` の辞書。
+            ``図版`` BLOCK のキーがヒットすればコメントの代わりに ``![図版](path)``
+            を出力する。
+    """
     if block.type_ in skip_types:
         return None
 
     if block.type_ == "図版":
+        # 切り出し済み画像があれば埋め込む
+        if figures_map:
+            img_rel = figures_map.get((block.x, block.y, block.w, block.h))
+            if img_rel:
+                return f"![図版]({img_rel})"
         if include_figure_placeholder:
             return f"<!-- 図版 (x={block.x}, y={block.y}, w={block.w}, h={block.h}) -->"
         return None
@@ -301,6 +313,7 @@ def xml_to_markdown(
     skip_types: Iterable[str] = SKIP_TYPES_DEFAULT,
     include_figure_placeholder: bool = True,
     keep_running_header: bool = False,
+    figures_map: dict[tuple[int, int, int, int], str] | None = None,
 ) -> str:
     skip = set(skip_types)
     tree = etree.parse(str(xml_path))
@@ -315,7 +328,8 @@ def xml_to_markdown(
     md_chunks: list[str] = []
     for b in blocks:
         chunk = block_to_markdown(
-            b, page_w, page_h, skip, include_figure_placeholder, keep_running_header
+            b, page_w, page_h, skip, include_figure_placeholder,
+            keep_running_header, figures_map,
         )
         if chunk:
             md_chunks.append(chunk)

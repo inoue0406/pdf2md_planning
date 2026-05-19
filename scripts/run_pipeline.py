@@ -9,6 +9,7 @@ Markdown（全ページ結合）と中間生成物を残す。
       <pdf_stem>/
         images/        # ページPNG (NDLOCR-Liteに食わせる)
         ocr/           # ndlocr-lite の出力 (.xml/.json/.txt)
+        figures/       # 図版BLOCKを切り出したPNG
         pages/         # ページごとのMarkdown
         <pdf_stem>.md  # 全ページ結合済みMarkdown
 """
@@ -23,11 +24,13 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Iterable
 
 # ローカルmodule
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pdf_to_images import pdf_to_images, _safe_name  # noqa: E402
 from ndl_xml_to_markdown import xml_to_markdown, SKIP_TYPES_DEFAULT  # noqa: E402
+from extract_figures import extract_figures_from_page  # noqa: E402
 
 
 log = logging.getLogger("pdf2md")
@@ -99,6 +102,51 @@ def _page_no_from_stem(stem: str) -> int:
     return int(m.group(1)) if m else 10**9
 
 
+def extract_figures_for_pdf(
+    images_dir: Path,
+    xml_dir: Path,
+    figures_dir: Path,
+    block_types: Iterable[str] = ("図版",),
+) -> tuple[dict[str, dict[tuple[int, int, int, int], str]], int]:
+    """全ページの図版BLOCKを切り出し、ページごとの ``figures_map`` を返す。
+
+    Returns:
+        (per_page_maps, total)
+        per_page_maps: ``xml.stem -> {(x,y,w,h): "figures/xxx.png"}``。
+            markdownから参照しやすいよう、画像パスは combined_md からの相対パス
+            (``figures/<stem>_p####_fig##.png``) で格納する。
+        total: 切り出した図版の総数
+    """
+    per_page: dict[str, dict[tuple[int, int, int, int], str]] = {}
+    total = 0
+
+    xmls = sorted(xml_dir.glob("*.xml"), key=lambda p: _page_no_from_stem(p.stem))
+    for xml_path in xmls:
+        # 同名のPNGを探す
+        png_path = images_dir / f"{xml_path.stem}.png"
+        if not png_path.exists():
+            # 画像が削除済みの場合はスキップ（既存OCR結果のみ手元にあるケース）
+            continue
+        figs = extract_figures_from_page(
+            image_path=png_path,
+            xml_path=xml_path,
+            out_dir=figures_dir,
+            block_types=block_types,
+        )
+        if not figs:
+            continue
+        page_map: dict[tuple[int, int, int, int], str] = {}
+        for f in figs:
+            # combined_md / pages/<page>.md の両方から参照できるよう、
+            # 出力ルート(figures_dirの1つ上)を基準にした相対パスにする。
+            rel = f"figures/{f.path.name}"
+            page_map[f.key] = rel
+        per_page[xml_path.stem] = page_map
+        total += len(figs)
+
+    return per_page, total
+
+
 def combine_pages_markdown(
     xml_dir: Path,
     pages_dir: Path,
@@ -106,6 +154,7 @@ def combine_pages_markdown(
     pdf_name: str,
     skip_types: set[str],
     keep_running_header: bool = False,
+    figures_per_page: dict[str, dict[tuple[int, int, int, int], str]] | None = None,
 ) -> int:
     """OCR XML をページMarkdownに変換し、ページ番号順に結合する。
 
@@ -119,23 +168,36 @@ def combine_pages_markdown(
         return 0
 
     combined_md.parent.mkdir(parents=True, exist_ok=True)
+    figures_per_page = figures_per_page or {}
     with combined_md.open("w", encoding="utf-8") as fout:
         fout.write(f"# {pdf_name}\n\n")
         fout.write(f"<!-- 自動生成: NDLOCR-Lite + PyMuPDF -->\n\n")
 
         for xml_path in xml_files:
             page_no = _page_no_from_stem(xml_path.stem)
-            md = xml_to_markdown(
+            page_figs = figures_per_page.get(xml_path.stem)
+            # combined_mdから見た相対パスはそのまま使える(同じディレクトリ階層)。
+            md_for_combined = xml_to_markdown(
                 xml_path,
                 skip_types=skip_types,
                 keep_running_header=keep_running_header,
+                figures_map=page_figs,
+            )
+            # ページ別.mdは1階層深いので "../figures/..." に書き換え
+            md_for_page = xml_to_markdown(
+                xml_path,
+                skip_types=skip_types,
+                keep_running_header=keep_running_header,
+                figures_map=(
+                    {k: f"../{v}" for k, v in page_figs.items()} if page_figs else None
+                ),
             )
             page_md_path = pages_dir / f"{xml_path.stem}.md"
-            page_md_path.write_text(md, encoding="utf-8")
+            page_md_path.write_text(md_for_page, encoding="utf-8")
 
             fout.write(f"\n\n---\n\n")
             fout.write(f"<!-- page {page_no} -->\n\n")
-            fout.write(md.rstrip())
+            fout.write(md_for_combined.rstrip())
             fout.write("\n")
 
     return len(xml_files)
@@ -152,6 +214,7 @@ def process_pdf(
     ndlocr_bin: str,
     keep_images: bool,
     keep_running_header: bool,
+    extract_figure_types: tuple[str, ...],
     extra_ocr_args: list[str] | None,
 ) -> None:
     """1つのPDFを処理する。"""
@@ -160,6 +223,7 @@ def process_pdf(
     pdf_out_root = out_root / safe_stem
     images_dir = pdf_out_root / "images"
     ocr_dir = pdf_out_root / "ocr"
+    figures_dir = pdf_out_root / "figures"
     pages_dir = pdf_out_root / "pages"
     combined_md = pdf_out_root / f"{safe_stem}.md"
 
@@ -193,7 +257,30 @@ def process_pdf(
             extra_args=extra_ocr_args,
         )
 
-    # 3) XML -> Markdown (per page + combined)
+    # 3) 図版BLOCKを切り出してPNG保存 (画像cleanupより前に必ず実行する)
+    figures_per_page: dict[str, dict[tuple[int, int, int, int], str]] = {}
+    if extract_figure_types:
+        if not (images_dir.exists() and any(images_dir.glob("*.png"))):
+            # OCR結果はあるが画像が無い場合、必要なページだけ再レンダする。
+            log.info("images missing — re-rendering for figure extraction")
+            pdf_to_images(
+                pdf_path,
+                images_dir,
+                dpi=dpi,
+                first_page=first_page,
+                last_page=last_page,
+                prefix=safe_stem,
+            )
+        log.info("extracting figures (%s) ...", ",".join(extract_figure_types))
+        figures_per_page, n_figs = extract_figures_for_pdf(
+            images_dir=images_dir,
+            xml_dir=ocr_dir,
+            figures_dir=figures_dir,
+            block_types=extract_figure_types,
+        )
+        log.info("extracted %d figure(s) into %s", n_figs, figures_dir)
+
+    # 4) XML -> Markdown (per page + combined)
     n_pages = combine_pages_markdown(
         xml_dir=ocr_dir,
         pages_dir=pages_dir,
@@ -201,9 +288,10 @@ def process_pdf(
         pdf_name=pdf_path.name,
         skip_types=skip_types,
         keep_running_header=keep_running_header,
+        figures_per_page=figures_per_page,
     )
 
-    # 4) optional cleanup
+    # 5) optional cleanup
     if not keep_images:
         try:
             shutil.rmtree(images_dir)
@@ -227,6 +315,13 @@ def main() -> None:
         "--keep-running-header",
         action="store_true",
         help="ページ上下端の柱書き相当(誤分類のキャプション含む)を残す",
+    )
+    ap.add_argument(
+        "--extract-figures",
+        nargs="*",
+        default=["図版"],
+        metavar="BLOCK_TYPE",
+        help="ページ画像から切り出すBLOCK/TYPE一覧 (空指定で抽出オフ)。例: 図版 表組",
     )
     ap.add_argument(
         "--skip-types",
@@ -269,6 +364,7 @@ def main() -> None:
                 ndlocr_bin=bin_path,
                 keep_images=args.keep_images,
                 keep_running_header=args.keep_running_header,
+                extract_figure_types=tuple(args.extract_figures),
                 extra_ocr_args=None,
             )
         except Exception as e:
