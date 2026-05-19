@@ -7,7 +7,9 @@
 - 入力ディレクトリ内のすべてのPDFを順次処理
 - ページごとにPNG (PyMuPDF) → NDLOCR-Lite (CLI) → Markdown化
 - 章節タイトルを `## / ### / ####` に昇格、本文は段落として復元
-- 表組はLINE座標から行・列を**自動再構築してMarkdownの表** (`| a | b |\n|---|---|`) に変換。複雑すぎて推定が破綻するとフラット箇条書きへ自動フォールバック
+- 表組はLINE座標から行・列を**自動再構築してMarkdownの表** (`| a | b |\n|---|---|`) に変換。
+  縦書きの巨大ラベル(`本編`/`第N部…`)は対応するY範囲の行に**複製配置** (Markdown rowspan の近似)。
+  推定が破綻したら**表組PNGを埋込**＋`<details>`内に生テキストへ自動フォールバック
 - **図版はページ画像から切り出して個別PNG化**し、Markdownに `![図版](figures/…)` として埋め込む
 - ページ番号・柱書き（章節名のランニングヘッダ）は自動で除去
 - 中断・再開に対応（既存PNG・OCR結果があればスキップ）
@@ -108,7 +110,13 @@ uv run python scripts/run_pipeline.py \
 | `--enable-tcy` | off | 縦中横の認識を改善（NDLOCR-Liteのオプションをそのまま透過） |
 | `--keep-images` | off | 中間PNGを削除しない |
 | `--keep-running-header` | off | 章節ヘッダ等を除去せず残す |
-| `--extract-figures TYPE ...` | `図版` | ページ画像から切り出すBLOCK/TYPE一覧。空指定で抽出オフ。例: `--extract-figures 図版 表組` |
+| `--extract-figures TYPE ...` | `図版` | ページ画像から切り出すBLOCK/TYPE一覧。`--table-mode`が画像を必要とするときは `表組` も自動マージされる |
+| `--table-mode {auto,grid,grid+image,image,list}` | `auto` | 表組の出力モード（後述） |
+| `--table-max-cols N` | `12` | これより列が多いと推定破綻と判定 |
+| `--table-row-thresh RATIO` | `0.6` | 行クラスタしきい値 / 行高中央値 |
+| `--table-col-thresh RATIO` | `0.8` | 列クラスタしきい値 / 行高中央値 |
+| `--table-spanning-h RATIO` | `3.0` | 行高中央値の何倍以上を spanning とみなすか (0で機能オフ) |
+| `--no-table-fallback-text` | off | fallback時の `<details>` 内生テキスト併記をやめる |
 | `--skip-types ...` | `ノンブル 柱 広告文字` | Markdown化時に無視するLINE TYPE |
 | `--glob PATTERN` | `*.pdf` | 入力選択パターン |
 | `--continue-on-error` | off | 失敗PDFを飛ばして続行 |
@@ -157,24 +165,44 @@ NDLOCR-Liteの出力XMLには、`LINE`要素ごとに `TYPE` (本文/タイト�
 
 500ページ規模のPDFで15〜25分が目安です。CUDA GPU環境では `extra_args=["--device", "cuda"]` を `process_pdf` に渡せばGPUモードも使えます（onnxruntime-gpuが必要）。
 
-### 表組の構造化（MVP, Phase 1）
+### 表組の構造化
 
 `scripts/table_structure.py` で行・列の2段クラスタリングを使って再構築:
 
 1. **行クラスタ**: LINEのY中央値を昇順に並べ、行高中央値 × `row_thresh_ratio` (=0.6) を超える隙間で行を切る
 2. **列クラスタ**: LINEの基準X（横書きはx_left、縦書きはx_center）でgreedyクラスタしたあと、**X範囲(x_left..x_right)が重なるクラスタ同士をマージ**することで、中央寄せヘッダがデータ列に正しく合流する
 3. **セル割当**: 各LINEを最寄りの(行, 列)に振り、同セルの複数LINEは`<br>`で連結
-4. **品質ガード**: 列数 < 2 または > `max_cols`(=12) のとき `None` を返し、呼び出し側が**フラット箇条書きへ自動フォールバック**
+4. **spanning cell複製配置 (Phase 3)**: 行高中央値の `--table-spanning-h` 倍(既定3.0)以上の高さを持つLINEは「縦書きセクションラベル」とみなし、そのY範囲が覆う**すべての行に複製配置**する（Markdownはrowspan非対応のため近似）
+5. **品質ガード**: 列数 < 2 または > `max_cols`(=12) のときgridを断念し、`--table-mode` に応じて画像 / フラット箇条書きにフォールバック
 
-検証結果（熊本市地域防災計画 本編 454ページ）:
-- 構造化された表: **187件**
-- フラット箇条書きフォールバック: **13件**（複雑な目次表など）
-- 約93%の表が`| ... |`のMarkdown表として出力
+#### --table-mode の挙動 (Phase 2)
 
-既知の限界（Phase 2/3で対応予定）:
-- rowspan/colspan は Markdownで表現不能のため、対応するセルにのみ書き他は空欄
-- 縦書き巨大ラベル(`本編`/`第N部…`)は1つのセル位置にしか配置されない
-- 表組PNGを画像としても保存したい場合は `--extract-figures 図版 表組` を指定
+| mode | grid成功時 | grid失敗時 |
+|---|---|---|
+| `auto` (既定) | Markdown表のみ | 表組PNG `![表組](...)` + `<details>` 内に生テキスト |
+| `grid` | Markdown表のみ | フラット箇条書き (旧挙動) |
+| `grid+image` | Markdown表 + 表組PNG | 表組PNG + `<details>` |
+| `image` | 常に表組PNG + `<details>` | 同左 |
+| `list` | 常にフラット箇条書き | 同左 |
+
+`auto` / `grid+image` / `image` を指定すると、`--extract-figures` に `表組` が**自動でマージ**され、`figures/<stem>_p####_tbl##.png` として表組PNGも切り出される。
+
+#### 検証結果（熊本市地域防災計画 本編 454ページ・全Phase）
+
+| 区分 | 件数 |
+|---|---|
+| 構造化Markdown表 (`rows=N cols=M`) | **187** |
+| 画像 + details にフォールバック | **13** |
+| spanning配置が発火した表 | 12 |
+| 抽出された表組PNG (`_tbl##.png`) | 212 |
+| 抽出された図版PNG (`_fig##.png`) | 99 |
+| Markdown表データ行 (`\| ... \|`) | 2,984 |
+
+複雑な目次表 (p0013, p0015一部) も画像とテキストの両方で確認可能になった。
+
+既知の限界:
+- rowspan/colspan は Markdownで完全表現不能。spanning は「複製配置」で近似
+- 縦書きラベルのY範囲はOCRで検出されたテキストの矩形と一致しないことがあり、ラベルが本来カバーすべき範囲より狭く配置されるケースあり (例: `本編` は2行しかカバーしない)
 
 ### 図版抽出の挙動
 

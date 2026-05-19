@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pdf_to_images import pdf_to_images, _safe_name  # noqa: E402
 from ndl_xml_to_markdown import xml_to_markdown, SKIP_TYPES_DEFAULT  # noqa: E402
 from extract_figures import extract_figures_from_page  # noqa: E402
+from table_structure import TableConfig, MODES as TABLE_MODES  # noqa: E402
 
 
 log = logging.getLogger("pdf2md")
@@ -107,25 +108,23 @@ def extract_figures_for_pdf(
     xml_dir: Path,
     figures_dir: Path,
     block_types: Iterable[str] = ("図版",),
-) -> tuple[dict[str, dict[tuple[int, int, int, int], str]], int]:
-    """全ページの図版BLOCKを切り出し、ページごとの ``figures_map`` を返す。
+) -> tuple[dict[str, dict[str, dict[tuple[int, int, int, int], str]]], dict[str, int]]:
+    """全ページの図版/表組BLOCKを切り出し、ページごとに BLOCK TYPE 別の map を返す。
 
     Returns:
-        (per_page_maps, total)
-        per_page_maps: ``xml.stem -> {(x,y,w,h): "figures/xxx.png"}``。
-            markdownから参照しやすいよう、画像パスは combined_md からの相対パス
-            (``figures/<stem>_p####_fig##.png``) で格納する。
-        total: 切り出した図版の総数
+        (per_page_by_type, totals)
+
+        ``per_page_by_type[xml_stem][block_type] = {(x,y,w,h): "figures/xxx.png"}``
+
+        ``totals[block_type] = count``
     """
-    per_page: dict[str, dict[tuple[int, int, int, int], str]] = {}
-    total = 0
+    per_page: dict[str, dict[str, dict[tuple[int, int, int, int], str]]] = {}
+    totals: dict[str, int] = {t: 0 for t in block_types}
 
     xmls = sorted(xml_dir.glob("*.xml"), key=lambda p: _page_no_from_stem(p.stem))
     for xml_path in xmls:
-        # 同名のPNGを探す
         png_path = images_dir / f"{xml_path.stem}.png"
         if not png_path.exists():
-            # 画像が削除済みの場合はスキップ（既存OCR結果のみ手元にあるケース）
             continue
         figs = extract_figures_from_page(
             image_path=png_path,
@@ -135,16 +134,14 @@ def extract_figures_for_pdf(
         )
         if not figs:
             continue
-        page_map: dict[tuple[int, int, int, int], str] = {}
+        by_type: dict[str, dict[tuple[int, int, int, int], str]] = {}
         for f in figs:
-            # combined_md / pages/<page>.md の両方から参照できるよう、
-            # 出力ルート(figures_dirの1つ上)を基準にした相対パスにする。
             rel = f"figures/{f.path.name}"
-            page_map[f.key] = rel
-        per_page[xml_path.stem] = page_map
-        total += len(figs)
+            by_type.setdefault(f.block_type, {})[f.key] = rel
+            totals[f.block_type] = totals.get(f.block_type, 0) + 1
+        per_page[xml_path.stem] = by_type
 
-    return per_page, total
+    return per_page, totals
 
 
 def combine_pages_markdown(
@@ -154,7 +151,8 @@ def combine_pages_markdown(
     pdf_name: str,
     skip_types: set[str],
     keep_running_header: bool = False,
-    figures_per_page: dict[str, dict[tuple[int, int, int, int], str]] | None = None,
+    figures_per_page: dict[str, dict[str, dict[tuple[int, int, int, int], str]]] | None = None,
+    table_cfg: "TableConfig | None" = None,
 ) -> int:
     """OCR XML をページMarkdownに変換し、ページ番号順に結合する。
 
@@ -169,28 +167,38 @@ def combine_pages_markdown(
 
     combined_md.parent.mkdir(parents=True, exist_ok=True)
     figures_per_page = figures_per_page or {}
+
+    def _shift(d: dict | None, prefix: str) -> dict | None:
+        """pages/*.md 用に相対パス先頭に prefix を付ける"""
+        if not d:
+            return d
+        return {k: f"{prefix}{v}" for k, v in d.items()}
+
     with combined_md.open("w", encoding="utf-8") as fout:
         fout.write(f"# {pdf_name}\n\n")
         fout.write(f"<!-- 自動生成: NDLOCR-Lite + PyMuPDF -->\n\n")
 
         for xml_path in xml_files:
             page_no = _page_no_from_stem(xml_path.stem)
-            page_figs = figures_per_page.get(xml_path.stem)
-            # combined_mdから見た相対パスはそのまま使える(同じディレクトリ階層)。
+            page_data = figures_per_page.get(xml_path.stem, {})
+            figs_map = page_data.get("図版")
+            tbls_map = page_data.get("表組")
+
             md_for_combined = xml_to_markdown(
                 xml_path,
                 skip_types=skip_types,
                 keep_running_header=keep_running_header,
-                figures_map=page_figs,
+                figures_map=figs_map,
+                tables_map=tbls_map,
+                table_cfg=table_cfg,
             )
-            # ページ別.mdは1階層深いので "../figures/..." に書き換え
             md_for_page = xml_to_markdown(
                 xml_path,
                 skip_types=skip_types,
                 keep_running_header=keep_running_header,
-                figures_map=(
-                    {k: f"../{v}" for k, v in page_figs.items()} if page_figs else None
-                ),
+                figures_map=_shift(figs_map, "../"),
+                tables_map=_shift(tbls_map, "../"),
+                table_cfg=table_cfg,
             )
             page_md_path = pages_dir / f"{xml_path.stem}.md"
             page_md_path.write_text(md_for_page, encoding="utf-8")
@@ -215,6 +223,7 @@ def process_pdf(
     keep_images: bool,
     keep_running_header: bool,
     extract_figure_types: tuple[str, ...],
+    table_cfg: TableConfig,
     extra_ocr_args: list[str] | None,
 ) -> None:
     """1つのPDFを処理する。"""
@@ -257,11 +266,10 @@ def process_pdf(
             extra_args=extra_ocr_args,
         )
 
-    # 3) 図版BLOCKを切り出してPNG保存 (画像cleanupより前に必ず実行する)
-    figures_per_page: dict[str, dict[tuple[int, int, int, int], str]] = {}
+    # 3) 図版/表組BLOCKを切り出してPNG保存 (画像cleanupより前に必ず実行する)
+    figures_per_page: dict[str, dict[str, dict[tuple[int, int, int, int], str]]] = {}
     if extract_figure_types:
         if not (images_dir.exists() and any(images_dir.glob("*.png"))):
-            # OCR結果はあるが画像が無い場合、必要なページだけ再レンダする。
             log.info("images missing — re-rendering for figure extraction")
             pdf_to_images(
                 pdf_path,
@@ -271,14 +279,15 @@ def process_pdf(
                 last_page=last_page,
                 prefix=safe_stem,
             )
-        log.info("extracting figures (%s) ...", ",".join(extract_figure_types))
-        figures_per_page, n_figs = extract_figures_for_pdf(
+        log.info("extracting blocks (%s) ...", ",".join(extract_figure_types))
+        figures_per_page, totals = extract_figures_for_pdf(
             images_dir=images_dir,
             xml_dir=ocr_dir,
             figures_dir=figures_dir,
             block_types=extract_figure_types,
         )
-        log.info("extracted %d figure(s) into %s", n_figs, figures_dir)
+        for t in extract_figure_types:
+            log.info("  %s: %d extracted", t, totals.get(t, 0))
 
     # 4) XML -> Markdown (per page + combined)
     n_pages = combine_pages_markdown(
@@ -289,6 +298,7 @@ def process_pdf(
         skip_types=skip_types,
         keep_running_header=keep_running_header,
         figures_per_page=figures_per_page,
+        table_cfg=table_cfg,
     )
 
     # 5) optional cleanup
@@ -336,6 +346,30 @@ def main() -> None:
     )
     ap.add_argument("--log", type=Path, default=Path("logs/pipeline.log"))
     ap.add_argument("--continue-on-error", action="store_true")
+
+    # 表組のレンダリング
+    ap.add_argument(
+        "--table-mode",
+        choices=TABLE_MODES,
+        default="auto",
+        help=(
+            "表組の出力モード。"
+            "auto: 推定OKならMarkdown表、ダメなら画像+詳細にfallback (既定); "
+            "grid: 表のみ; grid+image: 表と画像を併記; "
+            "image: 画像のみ + <details>に生テキスト; "
+            "list: 常にフラット箇条書き (旧挙動)"
+        ),
+    )
+    ap.add_argument("--table-max-cols", type=int, default=12)
+    ap.add_argument("--table-row-thresh", type=float, default=0.6,
+                    help="行クラスタしきい値 / 行高中央値 (既定 0.6)")
+    ap.add_argument("--table-col-thresh", type=float, default=0.8,
+                    help="列クラスタしきい値 / 行高中央値 (既定 0.8)")
+    ap.add_argument("--table-spanning-h", type=float, default=3.0,
+                    help="行高中央値の何倍以上を spanning とみなすか (0 で機能オフ)")
+    ap.add_argument("--no-table-fallback-text", action="store_true",
+                    help="fallback時に <details> へ生テキストを併記しない")
+
     args = ap.parse_args()
 
     setup_logging(args.log)
@@ -349,6 +383,21 @@ def main() -> None:
     log.info("found %d PDFs", len(pdfs))
 
     skip = set(args.skip_types)
+
+    # 表組モードが画像を必要とする場合、--extract-figures に「表組」を自動マージ
+    extract_figs = list(args.extract_figures)
+    if args.table_mode in ("auto", "grid+image", "image") and "表組" not in extract_figs:
+        log.info("table-mode=%s なので --extract-figures に「表組」を自動追加", args.table_mode)
+        extract_figs.append("表組")
+
+    table_cfg = TableConfig(
+        mode=args.table_mode,
+        max_cols=args.table_max_cols,
+        row_thresh_ratio=args.table_row_thresh,
+        col_thresh_ratio=args.table_col_thresh,
+        spanning_h_ratio=args.table_spanning_h,
+        keep_fallback_text=not args.no_table_fallback_text,
+    )
 
     failures: list[tuple[Path, Exception]] = []
     for pdf in pdfs:
@@ -364,7 +413,8 @@ def main() -> None:
                 ndlocr_bin=bin_path,
                 keep_images=args.keep_images,
                 keep_running_header=args.keep_running_header,
-                extract_figure_types=tuple(args.extract_figures),
+                extract_figure_types=tuple(extract_figs),
+                table_cfg=table_cfg,
                 extra_ocr_args=None,
             )
         except Exception as e:

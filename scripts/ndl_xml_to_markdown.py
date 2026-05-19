@@ -233,14 +233,17 @@ def block_to_markdown(
     include_figure_placeholder: bool,
     keep_running_header: bool,
     figures_map: dict[tuple[int, int, int, int], str] | None = None,
+    tables_map: dict[tuple[int, int, int, int], str] | None = None,
     table_cfg: TableConfig | None = None,
 ) -> str | None:
     """1ブロックをMarkdown断片に変換。スキップ対象は None を返す。
 
     Args:
-        figures_map: ``(x, y, w, h) -> markdownから参照する画像の相対パス`` の辞書。
-            ``図版`` BLOCK のキーがヒットすればコメントの代わりに ``![図版](path)``
-            を出力する。
+        figures_map: ``(x, y, w, h) -> 図版PNGの相対パス`` の辞書。
+            ``図版`` BLOCK のキーがヒットすればコメントの代わりに ``![図版](path)`` を出力。
+        tables_map: ``(x, y, w, h) -> 表組PNGの相対パス`` の辞書。
+            ``--table-mode`` が ``grid+image`` / ``image`` / ``auto`` (fallback時) の
+            場合に、表組PNGを埋め込むために使う。
         table_cfg: 表組の構造化変換の設定。``None`` で既定値。
     """
     if block.type_ in skip_types:
@@ -257,20 +260,11 @@ def block_to_markdown(
         return None
 
     if block.type_ == "表組":
-        # まずは座標から表の2D構造を再構築してMarkdown表に。失敗時はフラット箇条書きに
-        # フォールバック（旧挙動）。
-        md_table = render_table_block(block, table_cfg or TableConfig())
-        if md_table is not None:
-            return md_table
-        cells = [ln.text for ln in block.lines if ln.text and ln.type_ not in skip_types]
-        if not cells:
-            return f"<!-- 表組 (x={block.x}, y={block.y}, w={block.w}, h={block.h}) -->"
-        # 構造化失敗時のフォールバック: 全セルをフラットな箇条書きで出す
-        lines_md = "\n".join(f"- {c}" for c in cells)
-        return (
-            f"<!-- 表組開始 (x={block.x}, y={block.y}, w={block.w}, h={block.h}) "
-            f"fallback=list -->\n{lines_md}\n<!-- 表組終了 -->"
-        )
+        # 表組PNGがあれば相対パスを取得
+        img_rel: str | None = None
+        if tables_map:
+            img_rel = tables_map.get((block.x, block.y, block.w, block.h))
+        return render_table_block(block, table_cfg or TableConfig(), image_rel=img_rel)
 
     # 柱書き（running header/footer）
     if not keep_running_header and _looks_like_running_header(block, page_w, page_h):
@@ -325,6 +319,7 @@ def xml_to_markdown(
     include_figure_placeholder: bool = True,
     keep_running_header: bool = False,
     figures_map: dict[tuple[int, int, int, int], str] | None = None,
+    tables_map: dict[tuple[int, int, int, int], str] | None = None,
     table_cfg: TableConfig | None = None,
 ) -> str:
     skip = set(skip_types)
@@ -341,7 +336,7 @@ def xml_to_markdown(
     for b in blocks:
         chunk = block_to_markdown(
             b, page_w, page_h, skip, include_figure_placeholder,
-            keep_running_header, figures_map, table_cfg,
+            keep_running_header, figures_map, tables_map, table_cfg,
         )
         if chunk:
             md_chunks.append(chunk)

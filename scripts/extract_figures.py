@@ -119,7 +119,14 @@ def extract_figures_from_page(
 
         stem = name_prefix or image_path.stem
         figures: list[Figure] = []
-        for i, b in enumerate(blocks, start=1):
+        # BLOCK TYPEごとに連番。図版は ``fig##``、表組は ``tbl##`` という命名にして
+        # ファイル一覧で目で区別できるようにする。
+        type_to_prefix = {"図版": "fig", "表組": "tbl"}
+        type_counters: dict[str, int] = {}
+        for b in blocks:
+            t = b["type"]
+            type_counters[t] = type_counters.get(t, 0) + 1
+            n = type_counters[t]
             x0 = max(0, int(round(b["x"] * sx)) - padding)
             y0 = max(0, int(round(b["y"] * sy)) - padding)
             x1 = min(iw, int(round((b["x"] + b["w"]) * sx)) + padding)
@@ -127,11 +134,12 @@ def extract_figures_from_page(
             if x1 <= x0 or y1 <= y0:
                 continue
             crop = im.crop((x0, y0, x1, y1))
-            out_path = out_dir / f"{stem}_fig{i:02d}.png"
+            prefix = type_to_prefix.get(t, "blk")
+            out_path = out_dir / f"{stem}_{prefix}{n:02d}.png"
             crop.save(out_path)
             figures.append(
                 Figure(
-                    block_type=b["type"],
+                    block_type=t,
                     x=b["x"], y=b["y"], w=b["w"], h=b["h"],
                     path=out_path,
                 )

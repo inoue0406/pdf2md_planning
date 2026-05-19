@@ -1,18 +1,14 @@
 """NDLOCR-Lite の ``<BLOCK TYPE="表組">`` の中身（座標つきLINE要素群）から、
 Markdownの表 (``| a | b |\n|---|---|\n| c | d |``) を再構築する。
 
-NDLOCR-LiteのXMLには行・列インデックスが含まれない（座標のみ）ので、
-ここではY座標の1次元クラスタリングで行を、X左辺の1次元クラスタリングで列を
-推定し、各LINEを最寄りの(行, 列)に割り当てる。
+設計（Phase 1 + 2 + 3）:
 
-- 縦書きの大きなラベル(`第N部…` のような rowspan 的要素)は、列クラスタリングの
-  ノイズになりやすいため、列アンカー計算には**横書きLINEのみ**を使う。
-  そのうえで、縦書きLINEは「その x 中央が一番近い列」に配置する。
-- 多くの行政文書の表は2列〜十数列。``cfg.max_cols`` を超える推定が出たら破綻と
-  みなして ``None`` を返し、呼び出し側で旧表現（フラット箇条書きなど）に
-  フォールバックする想定。
-- 結合セル (rowspan/colspan) はMarkdownで表現不能なため、MVPでは「該当する1
-  セルにだけテキストを書き、他の対応セルは空欄」というベストエフォート方針。
+- **Phase 1**: 座標から行・列を再構築 (cluster_rows / cluster_cols / assign_cells)。
+- **Phase 2**: 出力モード切替 (``TableConfig.mode``):
+  ``grid`` / ``grid+image`` / ``image`` / ``list`` / ``auto``。
+  ``auto`` は推定OKなら ``grid``、ダメなら ``image+details`` にフォールバック。
+- **Phase 3**: 縦書き巨大ラベル(``本編`` / ``第N部…``) を、そのY範囲内に位置する
+  すべての行に **複製配置** することで rowspan 的な「セクション見出し」を表現する。
 
 このモジュールは ``Block``/``Line`` 型を ``ndl_xml_to_markdown.py`` 側から
 import せず、 ``.x .y .w .h .text`` 属性を持つオブジェクトとして duck-type で
@@ -26,12 +22,26 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
+# 表組の出力モード
+MODES = ("auto", "grid", "grid+image", "image", "list")
+
+
 @dataclass
 class TableConfig:
-    """表組の構造化変換に関する閾値とオプション。"""
+    """表組の構造化変換に関する閾値・モード・オプション。"""
+
+    mode: str = "auto"
+    """auto / grid / grid+image / image / list
+
+    - ``auto``    : grid を試み、列数超過などで破綻したら image+details にfallback
+    - ``grid``    : grid のみ。破綻時は list にfallback
+    - ``grid+image``: 常に grid と image を併記。grid破綻時は image+details
+    - ``image``   : 画像のみ + ``<details>`` に生テキスト
+    - ``list``    : 常にフラット箇条書き (旧挙動)
+    """
 
     max_cols: int = 12
-    """これより列が多いと破綻とみなして None を返す。"""
+    """これより列が多いと破綻とみなす。"""
 
     min_rows: int = 2
     """これより行が少ないと表とみなさない。"""
@@ -42,11 +52,20 @@ class TableConfig:
     col_thresh_ratio: float = 0.8
     """列クラスタしきい値 = max(20, 行高中央値 * これ)"""
 
+    spanning_h_ratio: float = 3.0
+    """行高中央値のN倍以上の高さを持つLINEを spanning とみなす。0以下で機能オフ。"""
+
+    spanning_y_tolerance: float = 0.5
+    """spanning配置時、行中心が cell の y範囲 ±(行高 * この比) なら覆われたとみなす。"""
+
     newline_in_cell: str = "<br>"
-    """セル内の改行(マルチライン本文セルの結合)の表現。"""
+    """セル内の改行(マルチライン本文)の表現。"""
 
     header_mode: str = "auto"
-    """auto: 第1行をヘッダにして罫線を出す / first-row: 同上 / none: 罫線なし(GFM非対応)"""
+    """auto / first-row: 1行目をヘッダにする / none: ヘッダ罫線を出さない"""
+
+    keep_fallback_text: bool = True
+    """grid破綻時の出力に ``<details>`` で生テキストを併記するか。"""
 
 
 # --- 内部ヘルパ ---------------------------------------------------------------
@@ -70,20 +89,21 @@ def _greedy_cluster_sorted(values: list[float], threshold: float) -> list[list[f
     return clusters
 
 
+def _line_ref_x(ln: Any) -> float:
+    """列クラスタ用のXの基準値。横書きは左端、縦書きは中央。"""
+    if _line_is_vertical(ln):
+        return ln.x + ln.w / 2
+    return float(ln.x)
+
+
 # --- 行・列のクラスタリング ---------------------------------------------------
 
 
 def cluster_rows(lines: list[Any], threshold: float) -> list[list[int]]:
-    """LINEのY中央値で行クラスタを作る。
-
-    Returns:
-        行ごとの「lines のインデックスのリスト」のリスト。Y昇順。
-    """
+    """LINEのY中央値で行クラスタを作る。返り値はY昇順の「行ごとのline_idxリスト」。"""
     if not lines:
         return []
-    indexed = sorted(
-        enumerate(lines), key=lambda p: p[1].y + p[1].h / 2
-    )
+    indexed = sorted(enumerate(lines), key=lambda p: p[1].y + p[1].h / 2)
     rows: list[list[int]] = []
     cur: list[int] = []
     cur_last_cy: float | None = None
@@ -101,13 +121,6 @@ def cluster_rows(lines: list[Any], threshold: float) -> list[list[int]]:
     return rows
 
 
-def _line_ref_x(ln: Any) -> float:
-    """列クラスタ用のXの基準値。横書きは左端、縦書きは中央。"""
-    if _line_is_vertical(ln):
-        return ln.x + ln.w / 2
-    return float(ln.x)
-
-
 def cluster_cols(
     lines: list[Any],
     use_indices: Iterable[int],
@@ -116,19 +129,12 @@ def cluster_cols(
     """LINEの基準X (横書き=x_left / 縦書き=cx) を1次元クラスタリングし、
     続いてX範囲(=x_left..x_right)が重なるクラスタを再結合して、各列のアンカーX を返す。
 
-    - 横書きセル内に複数行(マルチライン本文)があるとき、それらは概ね同じ x_left を共有する
-      ため左端基準が自然。
-    - 縦書きラベルは細長く x_left が列の左寄りに張り出すので中央xの方が列代表値として妥当。
-    - ヘッダ行など x_left がデータ行とずれているケースがあるため、クラスタ後に **X範囲が
-      重なるもの同士を統合** する。これで「機関の名称」のような中央寄せヘッダが
-      データ列に正しくマージされる。
+    ヘッダ行など x_left がデータ行とずれているケースを、X範囲の重なりで救う。
     """
     indices = list(use_indices)
     if not indices:
         return []
-    # (ref_x, line_idx) でソート
     pairs = sorted(((_line_ref_x(lines[i]), i) for i in indices), key=lambda p: p[0])
-    # Phase 1: greedy 1D clustering on ref_x
     clusters: list[list[int]] = [[pairs[0][1]]]
     last_ref = pairs[0][0]
     for ref_x, i in pairs[1:]:
@@ -138,7 +144,6 @@ def cluster_cols(
             clusters.append([i])
         last_ref = ref_x
 
-    # Phase 2: 重なる X 範囲を持つクラスタ同士をマージする
     def cluster_range(cl: list[int]) -> tuple[int, int]:
         xs_left = [lines[i].x for i in cl]
         xs_right = [lines[i].x + lines[i].w for i in cl]
@@ -146,12 +151,10 @@ def cluster_cols(
 
     merged: list[list[int]] = []
     ranges: list[tuple[int, int]] = []
-    # min_x_left の昇順で処理
     indexed_clusters = sorted(clusters, key=lambda cl: cluster_range(cl)[0])
     for cl in indexed_clusters:
         xl, xr = cluster_range(cl)
         if merged and xl < ranges[-1][1]:
-            # 直前クラスタとX範囲が重なる → マージ
             merged[-1].extend(cl)
             prev_xl, prev_xr = ranges[-1]
             ranges[-1] = (min(prev_xl, xl), max(prev_xr, xr))
@@ -172,11 +175,7 @@ def assign_cells(
     row_groups: list[list[int]],
     col_anchors: list[int],
 ) -> dict[tuple[int, int], list[int]]:
-    """各LINEを最寄りの (row, col) に割り当てる。
-
-    Returns:
-        ``(row_idx, col_idx) -> [line_idx, ...]`` (各セルは Y, X 昇順)
-    """
+    """各LINEを最寄りの (row, col) に割り当てる。"""
     grid: dict[tuple[int, int], list[int]] = {}
     for r, indices in enumerate(row_groups):
         for i in indices:
@@ -190,6 +189,62 @@ def assign_cells(
     for k in grid:
         grid[k].sort(key=lambda i: (lines[i].y, lines[i].x))
     return grid
+
+
+# --- Phase 3: spanning cell の複製配置 ----------------------------------------
+
+
+def distribute_spanning_labels(
+    lines: list[Any],
+    row_groups: list[list[int]],
+    grid: dict[tuple[int, int], list[int]],
+    median_h: float,
+    cfg: TableConfig,
+) -> int:
+    """縦書き巨大ラベル(本編 / 第N部…)を、そのY範囲に位置するすべての行に複製配置する。
+
+    既に他のテキストがあるセルは触らない（rowspan的セクションラベルは「空セル」を
+    埋める形で広がるのが自然）。
+
+    Returns:
+        複製配置した spanning ラベルの個数（複製ヶ所数）。
+    """
+    if cfg.spanning_h_ratio <= 0 or median_h <= 0:
+        return 0
+
+    threshold_h = median_h * cfg.spanning_h_ratio
+    tol = median_h * cfg.spanning_y_tolerance
+
+    # 行ごとの中央Y
+    row_y_centers: list[float] = []
+    for indices in row_groups:
+        if indices:
+            ys = [lines[i].y + lines[i].h / 2 for i in indices]
+            row_y_centers.append(sum(ys) / len(ys))
+        else:
+            row_y_centers.append(0.0)
+
+    placements = 0
+    # gridに変更を加えるため、snapshot のキーで反復
+    for (r, c), idxs in list(grid.items()):
+        for i in list(idxs):
+            ln = lines[i]
+            if ln.h < threshold_h:
+                continue
+            # このLINEはspanning。Y範囲を取り、覆う他の行に複製
+            y_top = ln.y - tol
+            y_bot = ln.y + ln.h + tol
+            for r2 in range(len(row_groups)):
+                if r2 == r:
+                    continue
+                ycy = row_y_centers[r2]
+                if y_top <= ycy <= y_bot:
+                    cell_key = (r2, c)
+                    if cell_key not in grid:
+                        # 空セル → spanning ラベルを参照として置く
+                        grid[cell_key] = [i]
+                        placements += 1
+    return placements
 
 
 # --- Markdown描画 -------------------------------------------------------------
@@ -219,55 +274,41 @@ def render_markdown_table(
         return _sanitize_cell(newline.join(lines[i].text for i in idxs), newline)
 
     out: list[str] = []
-
     if header_mode in ("auto", "first-row"):
         header = [cell_text(0, c) or " " for c in range(n_cols)]
         out.append("| " + " | ".join(header) + " |")
         out.append("|" + "|".join(["---"] * n_cols) + "|")
         start_row = 1
     else:
-        # ヘッダ罫線なし。標準MarkdownはヘッダなしテーブルをサポートしないのでGFM相当の
-        # 軽量表現として、ダミー空ヘッダを出してから始める。
         out.append("| " + " | ".join([" "] * n_cols) + " |")
         out.append("|" + "|".join(["---"] * n_cols) + "|")
         start_row = 0
-
     for r in range(start_row, n_rows):
         row = [cell_text(r, c) or " " for c in range(n_cols)]
         out.append("| " + " | ".join(row) + " |")
-
     return "\n".join(out)
 
 
-# --- 公開API ------------------------------------------------------------------
+# --- 内部: grid生成・フラット箇条書き ----------------------------------------
 
 
-def render_table_block(block: Any, cfg: TableConfig | None = None) -> str | None:
-    """``<BLOCK TYPE="表組">`` に相当する Block を Markdown表に変換する。
-
-    Args:
-        block: ``.lines``, ``.x``, ``.y``, ``.w``, ``.h`` を持つ Block。
-            ``.lines`` の各要素は ``.x .y .w .h .text`` を持つ Line とする。
-        cfg: 閾値とオプション。``None`` で既定値を使用。
+def _attempt_grid(block: Any, cfg: TableConfig) -> tuple[str | None, int, int, int]:
+    """gridを推定して Markdown表テキストを返す。
 
     Returns:
-        Markdown断片。表組としての構造化に失敗した場合は ``None`` を返し、
-        呼び出し側で代替表現（旧フラット箇条書きや画像埋め込み）に
-        フォールバックする想定。
+        (md_table or None, n_rows, n_cols, n_spanning_placements).
+        破綻時は (None, 0, 0, 0)。
     """
-    cfg = cfg or TableConfig()
-
     lines = [ln for ln in (block.lines or []) if (ln.text or "").strip()]
     if len(lines) < cfg.min_rows:
-        return None
+        return None, 0, 0, 0
 
-    # 行高中央値: 列アンカーや閾値の基準にする。縦書きラベルは異常値になるので除外。
     horiz_indices = [i for i, ln in enumerate(lines) if not _line_is_vertical(ln)]
     if not horiz_indices:
         horiz_indices = list(range(len(lines)))
     heights = [lines[i].h for i in horiz_indices if lines[i].h > 0]
     if not heights:
-        return None
+        return None, 0, 0, 0
     median_h = statistics.median(heights)
 
     row_thresh = max(8.0, median_h * cfg.row_thresh_ratio)
@@ -275,17 +316,16 @@ def render_table_block(block: Any, cfg: TableConfig | None = None) -> str | None
 
     rows = cluster_rows(lines, row_thresh)
     if len(rows) < cfg.min_rows:
-        return None
+        return None, 0, 0, 0
 
-    # 列アンカー計算には全LINEを使う（縦書きラベルは中央xを基準にすることで、
-    # 横書きセルとは別の列として認識される）。
     col_anchors = cluster_cols(lines, range(len(lines)), col_thresh)
     if len(col_anchors) < 2 or len(col_anchors) > cfg.max_cols:
-        return None
+        return None, 0, 0, 0
 
     grid = assign_cells(lines, rows, col_anchors)
+    n_span = distribute_spanning_labels(lines, rows, grid, median_h, cfg)
 
-    md_table = render_markdown_table(
+    md = render_markdown_table(
         grid,
         n_rows=len(rows),
         n_cols=len(col_anchors),
@@ -293,9 +333,106 @@ def render_table_block(block: Any, cfg: TableConfig | None = None) -> str | None
         newline=cfg.newline_in_cell,
         header_mode=cfg.header_mode,
     )
+    return md, len(rows), len(col_anchors), n_span
 
-    head = (
-        f"<!-- 表組開始 (x={block.x}, y={block.y}, w={block.w}, h={block.h}) "
-        f"rows={len(rows)} cols={len(col_anchors)} -->"
+
+def _flat_list_markdown(lines: list[Any]) -> str:
+    cells = [ln.text for ln in lines if (ln.text or "").strip()]
+    if not cells:
+        return ""
+    return "\n".join(f"- {c}" for c in cells)
+
+
+# --- 公開API ------------------------------------------------------------------
+
+
+def render_table_block(
+    block: Any,
+    cfg: TableConfig | None = None,
+    image_rel: str | None = None,
+) -> str:
+    """``<BLOCK TYPE="表組">`` に相当する Block を Markdown断片に変換する。
+
+    ``cfg.mode`` に応じて grid / grid+image / image / list / auto を出し分ける。
+    呼び出し側は **常に Markdown 文字列** を受け取れる（None は返さない）。
+    """
+    cfg = cfg or TableConfig()
+    mode = cfg.mode if cfg.mode in MODES else "auto"
+
+    lines = [ln for ln in (block.lines or []) if (ln.text or "").strip()]
+    block_pos = (
+        f"x={block.x}, y={block.y}, w={block.w}, h={block.h}"
     )
-    return f"{head}\n\n{md_table}\n\n<!-- 表組終了 -->"
+    if not lines:
+        return f"<!-- 表組 ({block_pos}) -->"
+
+    flat_body = _flat_list_markdown(lines)
+
+    def _flat_block(tag: str) -> str:
+        head = f"<!-- 表組開始 ({block_pos}) {tag} -->"
+        return f"{head}\n{flat_body}\n<!-- 表組終了 -->"
+
+    def _details_text() -> str:
+        if not cfg.keep_fallback_text or not flat_body:
+            return ""
+        return (
+            "<details><summary>OCR生テキスト (構造未復元)</summary>\n\n"
+            f"{flat_body}\n\n"
+            "</details>"
+        )
+
+    def _image_md() -> str:
+        if image_rel:
+            return f"![表組]({image_rel})"
+        return ""
+
+    def _fallback_with_image() -> str:
+        # image + details (or list if details disabled)
+        parts: list[str] = []
+        img = _image_md()
+        if img:
+            parts.append(img)
+        det = _details_text()
+        if det:
+            parts.append(det)
+        elif not img:
+            # 画像も詳細も無いなら、最後の手段としてフラット箇条書き
+            parts.append(flat_body)
+        head = f"<!-- 表組開始 ({block_pos}) fallback=image+details -->"
+        body = "\n\n".join(parts)
+        return f"{head}\n\n{body}\n\n<!-- 表組終了 -->"
+
+    # mode=list は無条件にフラット箇条書き
+    if mode == "list":
+        return _flat_block("mode=list")
+
+    # mode=image は無条件に 画像+詳細
+    if mode == "image":
+        return _fallback_with_image()
+
+    md_grid, n_rows, n_cols, n_span = _attempt_grid(block, cfg)
+    grid_meta = (
+        f"rows={n_rows} cols={n_cols}" + (f" spans={n_span}" if n_span else "")
+    )
+
+    if mode == "grid":
+        if md_grid is None:
+            return _flat_block("fallback=list")
+        head = f"<!-- 表組開始 ({block_pos}) {grid_meta} -->"
+        return f"{head}\n\n{md_grid}\n\n<!-- 表組終了 -->"
+
+    if mode == "grid+image":
+        if md_grid is None:
+            return _fallback_with_image()
+        head = f"<!-- 表組開始 ({block_pos}) {grid_meta} -->"
+        body = md_grid
+        img = _image_md()
+        if img:
+            body = f"{body}\n\n{img}"
+        return f"{head}\n\n{body}\n\n<!-- 表組終了 -->"
+
+    # mode == "auto"
+    if md_grid is not None:
+        head = f"<!-- 表組開始 ({block_pos}) {grid_meta} -->"
+        return f"{head}\n\n{md_grid}\n\n<!-- 表組終了 -->"
+    return _fallback_with_image()
